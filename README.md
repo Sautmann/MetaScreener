@@ -1,7 +1,7 @@
 # Meta-Screener Tool
 
 > [!IMPORTANT]  
-> This repository contains the current and future state of the Meta-Screen tool developed by Shrenik Borad, Jonas Weinert, Anja Sautmann, Adisiri Swain as part of a meta-analysis automation exercise. It is a port from this now deprecated repository. For previous development and contribution history, review the above. For contributions and the most up to date version, refer to this repository at hand.
+> This repository contains the current and future state of the Meta-Screen tool developed by Shrenik Borad, Jonas Weinert, Anja Sautmann, Adisiri Swain as part of a meta-analysis automation exercise. It is a port from [this now deprecated repository](https://github.com/IDEAL-consortium/ideal-extract). For previous development and contribution history, review the above. For contributions and the most up to date version, refer to this repository at hand.
 
 ## Citation
 

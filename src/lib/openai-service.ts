@@ -12,36 +12,156 @@ import { downloadFile } from "./utils";
 
 // Function to get OpenAI client with API key from localStorage
 let openAIClient: OpenAI | null = null;
+let openAIClientKey: string | null = null;
 const isDryRun = false
 
 function getOpenAIClient(): OpenAI {
-  if (openAIClient) return openAIClient;
-
   const apiKey = localStorage.getItem('openai_api_key');
   if (!apiKey) {
     throw new Error('OpenAI API key not found. Please set it in Settings.');
   }
 
+  // Recreate the client if the stored key changed (e.g. after saving Settings)
+  if (openAIClient && openAIClientKey === apiKey) return openAIClient;
+
   openAIClient = new OpenAI({
     apiKey: apiKey,
     dangerouslyAllowBrowser: true,
   });
+  openAIClientKey = apiKey;
 
   return openAIClient;
+}
+
+/** Call after saving a new API key so subsequent requests use it. */
+export function resetOpenAIClient(): void {
+  openAIClient = null;
+  openAIClientKey = null;
 }
 
 // Cache helper for models list
 type ModelsCache = { models: string[]; cachedAt: number };
 
+// Bump the key when filter logic changes so stale lists are discarded
+const MODELS_CACHE_KEY = "openai_models_cache_v2";
+const MODELS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+export function clearModelsCache(): void {
+  localStorage.removeItem(MODELS_CACHE_KEY);
+  // Also drop the pre-v2 cache key if present
+  localStorage.removeItem("openai_models_cache");
+}
+
+// Fallback if the API is unreachable and nothing is cached
+const FALLBACK_MODELS = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5",
+  "gpt-5-mini",
+  "gpt-5-nano",
+  "gpt-4.1",
+  "gpt-4.1-mini",
+];
+
+// Specialty / non-chat model id fragments to hide from the screening picker
+const EXCLUDED_MODEL_PATTERNS = [
+  "audio",
+  "realtime",
+  "search",
+  "transcribe",
+  "tts",
+  "image",
+  "instruct",
+  "embedding",
+  "moderation",
+  "dall-e",
+  "whisper",
+  "davinci",
+  "babbage",
+  "codex",
+  "computer-use",
+  "deep-research",
+];
+
+function isChatCompletionModel(id: string): boolean {
+  const lower = id.toLowerCase();
+  // Chat-capable families: GPT*, ChatGPT aliases, and o-series reasoning models
+  const isChatFamily =
+    lower.startsWith("gpt-") ||
+    lower.startsWith("chatgpt-") ||
+    /^o\d/.test(lower);
+  if (!isChatFamily) return false;
+  // Fine-tunes use "ft:..." — skip those for the screening picker
+  if (lower.startsWith("ft:")) return false;
+  if (EXCLUDED_MODEL_PATTERNS.some((pattern) => lower.includes(pattern))) return false;
+  // Hide dated snapshots (e.g. gpt-4o-2024-08-06, gpt-5-2025-08-07);
+  // undated aliases / tier names (gpt-5.6-sol) point at the same models
+  if (/-\d{4}-\d{2}-\d{2}$/.test(lower)) return false;
+  if (/-\d{4}$/.test(lower)) return false; // e.g. gpt-4-0613
+  return true;
+}
+
+function readModelsCache(): ModelsCache | null {
+  try {
+    const raw = localStorage.getItem(MODELS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ModelsCache;
+    if (!Array.isArray(parsed.models) || parsed.models.length === 0) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export async function listAvailableModels(forceRefresh: boolean = false): Promise<string[]> {
-  // Hardcoded list of supported models
-  return [
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-  ];
+  const cached = readModelsCache();
+  if (!forceRefresh && cached && Date.now() - cached.cachedAt < MODELS_CACHE_TTL_MS) {
+    return cached.models;
+  }
+
+  if (forceRefresh) {
+    clearModelsCache();
+  }
+
+  try {
+    const openai = getOpenAIClient();
+    const models: Array<{ id: string; created?: number }> = [];
+    // Paginate via async iterator (SDK may return everything in one page today)
+    for await (const model of openai.models.list()) {
+      models.push(model);
+    }
+
+    const chatModels = models
+      .filter((m) => isChatCompletionModel(m.id))
+      .sort((a, b) => {
+        const createdDiff = (b.created ?? 0) - (a.created ?? 0);
+        if (createdDiff !== 0) return createdDiff;
+        return a.id.localeCompare(b.id);
+      })
+      .map((m) => m.id);
+
+    if (chatModels.length > 0) {
+      const cache: ModelsCache = { models: chatModels, cachedAt: Date.now() };
+      localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(cache));
+      return chatModels;
+    }
+
+    console.warn(
+      "OpenAI models.list returned no chat-capable models after filtering.",
+      `Raw count: ${models.length}. Sample:`,
+      models.slice(0, 20).map((m) => m.id)
+    );
+    return cached?.models ?? FALLBACK_MODELS;
+  } catch (error) {
+    // A stale cache is better than no models at all
+    if (cached) {
+      console.warn("Failed to refresh models from OpenAI, using cached list:", error);
+      return cached.models;
+    }
+    console.error("Failed to fetch available models:", error);
+    throw error;
+  }
 }
 
 export async function cancelBatch(batchId?: string): Promise<void> {

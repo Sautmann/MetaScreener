@@ -2,11 +2,14 @@
 
 import type React from "react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Separator } from "@/components/ui/separator";
@@ -16,9 +19,9 @@ import { processBatch } from "@/lib/batch-processor";
 import { addFile } from "@/lib/files-manager";
 import { createJob, updateJob } from "@/lib/job-manager";
 import { extractPdfDataBatch, matchPdfsToPapersAsync, PDFMatch } from "@/lib/pdf-utils";
-import { downloadFile } from "@/lib/utils";
+import { cn, downloadFile } from "@/lib/utils";
 import { Paper, PDFData,PaperWithFields } from "@/types";
-import { Download, Eye, Loader2, Plus, Trash2, Upload } from "lucide-react";
+import { Check, ChevronsUpDown, Download, Eye, Loader2, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import Papa from "papaparse";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -32,6 +35,14 @@ export default function ExtractFields() {
   const [mode, setMode] = useState<"fulltext" | "abstract">("abstract");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
+
+  const toggleModel = (model: string) => {
+    setSelectedModels((prev) =>
+      prev.includes(model) ? prev.filter((m) => m !== model) : [...prev, model]
+    );
+  };
   const [file, setFile] = useState<File | null>(null);
   const [fileErrors, setFileErrors] = useState<string[]>([]);
   const [pdfFolder, setPdfFolder] = useState<FileList | null>(null);
@@ -58,28 +69,50 @@ export default function ExtractFields() {
     }
   }, [customFields, extractJustification]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const models = await listAvailableModels();
-        if (!cancelled && models && models.length) {
-          setAvailableModels(models);
-          setSelectedModels([models[0]]);
-        }
-      } catch (e) {
-        console.error("Failed to load models", e);
-        const errorMessage = e instanceof Error ? e.message : "Unknown error occurred";
-        if (errorMessage.includes("API key")) {
-          toast.error("OpenAI API key not configured. Please set it in Settings.");
-        } else if (errorMessage.includes("network") || errorMessage.includes("fetch")) {
-          toast.error("Network error: Unable to connect to OpenAI. Please check your internet connection.");
-        } else {
-          toast.error(`Failed to load available models: ${errorMessage}`);
+  const loadModels = async (forceRefresh: boolean = false) => {
+    setModelsLoading(true);
+    try {
+      const models = await listAvailableModels(forceRefresh);
+      if (models && models.length) {
+        setAvailableModels(models);
+        setSelectedModels((prev) => {
+          const stillAvailable = prev.filter((m) => models.includes(m));
+          if (stillAvailable.length > 0) return stillAvailable;
+          const preferredDefaults = [
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-5-mini",
+            "gpt-5",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+          ];
+          const defaultModel = preferredDefaults.find((p) => models.includes(p)) ?? models[0];
+          return [defaultModel];
+        });
+        if (forceRefresh) {
+          toast.success(`Loaded ${models.length} models from OpenAI`);
         }
       }
-    })();
-    return () => { cancelled = true; };
+    } catch (e) {
+      console.error("Failed to load models", e);
+      const errorMessage = e instanceof Error ? e.message : "Unknown error occurred";
+      if (errorMessage.includes("API key")) {
+        toast.error("OpenAI API key not configured. Please set it in Settings.");
+      } else if (errorMessage.includes("network") || errorMessage.includes("fetch")) {
+        toast.error("Network error: Unable to connect to OpenAI. Please check your internet connection.");
+      } else {
+        toast.error(`Failed to load available models: ${errorMessage}`);
+      }
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
 
@@ -542,31 +575,78 @@ export default function ExtractFields() {
         </div>
         <div className="grid w-full gap-2">
           <Label className="text-xs">OpenAI Models</Label>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
-            {availableModels.length === 0 ? (
-              <p className="text-xs text-muted-foreground">Loading models…</p>
-            ) : (
-              availableModels.map((m) => {
-                const checked = selectedModels.includes(m);
-                return (
-                  <label key={m} className="inline-flex items-center gap-2 text-sm cursor-pointer">
-                    <Checkbox
-                      id={`model-${m}`}
-                      checked={checked}
-                      onCheckedChange={(v) => {
-                        setSelectedModels((prev) => {
-                          const next = new Set(prev);
-                          if (v) next.add(m); else next.delete(m);
-                          return Array.from(next);
-                        });
-                      }}
-                    />
-                    <span>{m}</span>
-                  </label>
-                );
-              })
-            )}
+          <div className="flex items-center gap-2">
+            <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  role="combobox"
+                  aria-expanded={modelPopoverOpen}
+                  className="w-full max-w-md justify-between font-normal cursor-pointer"
+                  disabled={modelsLoading && availableModels.length === 0}
+                >
+                  {modelsLoading && availableModels.length === 0
+                    ? "Loading models…"
+                    : selectedModels.length === 0
+                      ? "Select models…"
+                      : selectedModels.length === 1
+                        ? selectedModels[0]
+                        : `${selectedModels.length} models selected`}
+                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
+                <Command>
+                  <CommandInput placeholder="Search models…" />
+                  <CommandList>
+                    <CommandEmpty>No models found.</CommandEmpty>
+                    <CommandGroup>
+                      {availableModels.map((m) => (
+                        <CommandItem key={m} value={m} onSelect={() => toggleModel(m)}>
+                          <Check
+                            className={cn(
+                              "mr-2 h-4 w-4",
+                              selectedModels.includes(m) ? "opacity-100" : "opacity-0"
+                            )}
+                          />
+                          {m}
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => loadModels(true)}
+              disabled={modelsLoading}
+              title="Refresh model list from OpenAI"
+              className="shrink-0 cursor-pointer"
+            >
+              <RefreshCw className={cn("h-4 w-4", modelsLoading && "animate-spin")} />
+            </Button>
           </div>
+          {selectedModels.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {selectedModels.map((m) => (
+                <Badge key={m} variant="secondary" className="gap-1">
+                  {m}
+                  <button
+                    type="button"
+                    onClick={() => toggleModel(m)}
+                    className="cursor-pointer rounded-full hover:text-destructive"
+                    title={`Remove ${m}`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </Badge>
+              ))}
+            </div>
+          )}
           <HelpText 
             text="You can run the same job across multiple models. Progress reflects all batches."
             className="mt-1"

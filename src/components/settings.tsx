@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import OpenAI from 'openai';
 import { HelpText } from './help-text';
 import { useNavigate } from 'react-router-dom';
+import { clearModelsCache, resetOpenAIClient } from '@/lib/openai-service';
 
 const SettingsPage: React.FC = () => {
   const navigate = useNavigate();
@@ -61,6 +62,8 @@ const SettingsPage: React.FC = () => {
     if (isValid) {
       localStorage.setItem('openai_api_key', apiKey);
       localStorage.setItem('enable_logprobs', enableLogprobs.toString());
+      resetOpenAIClient();
+      clearModelsCache();
       toast.success('Settings saved successfully!');
     }
     

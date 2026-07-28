@@ -447,7 +447,8 @@ export default function ExtractFields() {
         options:{
           model: selectedModels[0],
           models: selectedModels,
-          downloadJsonl: downloadJsonl
+          downloadJsonl: downloadJsonl,
+          systemPromptOverride,
         }
       });
 

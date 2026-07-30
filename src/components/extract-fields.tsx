@@ -25,7 +25,7 @@ import { Check, ChevronsUpDown, Download, Eye, Loader2, Plus, RefreshCw, Trash2,
 import Papa from "papaparse";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { createSystemPrompt, listAvailableModels } from "@/lib/openai-service";
+import { createSystemPrompt, DEFAULT_MAX_COMPLETION_TOKENS, DEFAULT_TEMPERATURE, listAvailableModels } from "@/lib/openai-service";
 import SystemPromptViewer from "./SystemPromptViewer";
 import { useNavigate } from 'react-router-dom';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
@@ -57,6 +57,8 @@ export default function ExtractFields() {
   const [isMatching, setIsMatching] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadJsonl, setDownloadJsonl] = useState(false);
+  const [temperature, setTemperature] = useState(String(DEFAULT_TEMPERATURE));
+  const [maxCompletionTokens, setMaxCompletionTokens] = useState(String(DEFAULT_MAX_COMPLETION_TOKENS));
   const [systemPromptOverride, setSystemPromptOverride] = useState<string | undefined>(undefined);
   const navigate = useNavigate();
   // Sync justification checkbox with customFields
@@ -342,6 +344,18 @@ export default function ExtractFields() {
       return;
     }
 
+    const parsedTemperature = Number(temperature);
+    if (!Number.isFinite(parsedTemperature) || parsedTemperature < 0 || parsedTemperature > 2) {
+      toast.error("Temperature must be a number between 0 and 2.");
+      return;
+    }
+
+    const parsedMaxTokens = Number(maxCompletionTokens);
+    if (!Number.isFinite(parsedMaxTokens) || parsedMaxTokens < 1 || !Number.isInteger(parsedMaxTokens)) {
+      toast.error("Max completion tokens must be a whole number of at least 1.");
+      return;
+    }
+
     setIsSubmitting(true);
     try {
       // Prepare custom fields, including justification if enabled
@@ -448,6 +462,8 @@ export default function ExtractFields() {
           model: selectedModels[0],
           models: selectedModels,
           downloadJsonl: downloadJsonl,
+          temperature: parsedTemperature,
+          max_completion_tokens: parsedMaxTokens,
           systemPromptOverride,
         }
       });
@@ -658,6 +674,35 @@ export default function ExtractFields() {
             linkText="Learn more about log probabilities"
             className="mt-1"
           />
+          <div className="flex flex-wrap gap-4 mt-2">
+            <div className="space-y-1">
+              <Label htmlFor="temperature" className="text-xs">Temperature</Label>
+              <Input
+                id="temperature"
+                type="number"
+                min={0}
+                max={2}
+                step={0.1}
+                value={temperature}
+                onChange={(e) => setTemperature(e.target.value)}
+                className="w-28"
+              />
+              <p className="text-xs text-muted-foreground">0–2 · default {DEFAULT_TEMPERATURE}</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="max-completion-tokens" className="text-xs">Max Completion Tokens</Label>
+              <Input
+                id="max-completion-tokens"
+                type="number"
+                min={1}
+                step={1}
+                value={maxCompletionTokens}
+                onChange={(e) => setMaxCompletionTokens(e.target.value)}
+                className="w-36"
+              />
+              <p className="text-xs text-muted-foreground">default {DEFAULT_MAX_COMPLETION_TOKENS} · not applied to GPT-5</p>
+            </div>
+          </div>
           <div className="flex flex-col gap-2 mt-2">
             <div className="flex items-center gap-2 cursor-pointer">
               <Checkbox

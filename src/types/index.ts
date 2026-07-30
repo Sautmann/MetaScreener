@@ -25,6 +25,8 @@ export interface AIOptions {
   systemPromptOverride?: string;
   models?: string[];
   downloadJsonl?: boolean;
+  temperature?: number;
+  max_completion_tokens?: number;
 }
 
 export interface CustomField{

@@ -185,11 +185,32 @@ export async function cancelBatch(batchId?: string): Promise<void> {
     }
   }
 }
+export const DEFAULT_TEMPERATURE = 0.6;
+export const DEFAULT_MAX_COMPLETION_TOKENS = 1500;
+
+function resolveTemperature(options?: AIOptions): number {
+  const value = options?.temperature;
+  if (value == null || !Number.isFinite(value) || value < 0 || value > 2) {
+    return DEFAULT_TEMPERATURE;
+  }
+  return value;
+}
+
+function resolveMaxCompletionTokens(options?: AIOptions): number {
+  const value = options?.max_completion_tokens;
+  if (value == null || !Number.isFinite(value) || value < 1) {
+    return DEFAULT_MAX_COMPLETION_TOKENS;
+  }
+  return Math.floor(value);
+}
+
 const getAIOptions = (options?: AIOptions) => {
   const model = options?.model || "gpt-4.1";
   const isGpt5 = model.toLowerCase().startsWith("gpt-5");
   const isGpt41 = model.toLowerCase().startsWith("gpt-4.1");
   const enableLogprobs = localStorage.getItem('enable_logprobs') === 'true';
+  const temperature = resolveTemperature(options);
+  const max_completion_tokens = resolveMaxCompletionTokens(options);
   
   // GPT-5 models have stricter parameter requirements and don't support logprobs
   if (isGpt5) {
@@ -205,8 +226,8 @@ const getAIOptions = (options?: AIOptions) => {
       model,
       logprobs: true,
       top_logprobs: 4,
-      temperature: 1,
-      max_completion_tokens: 300,
+      temperature,
+      max_completion_tokens,
       top_p: 1,
       frequency_penalty: 0,
       presence_penalty: 0,
@@ -216,8 +237,8 @@ const getAIOptions = (options?: AIOptions) => {
   // Other models or logprobs disabled - default behavior without logprobs
   return {
     model,
-    temperature: 1,
-    max_completion_tokens: 300,
+    temperature,
+    max_completion_tokens,
     top_p: 1,
     frequency_penalty: 0,
     presence_penalty: 0,

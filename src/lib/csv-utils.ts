@@ -278,8 +278,10 @@ export async function downloadCSV(jobId: number, onlyProcessed?: boolean): Promi
   
   // Check if original CSV has an 'id' column (case-insensitive) that might have been used in batch creation
   // This handles backward compatibility with jobs created before the fix where CSV's id column was used
+  // Jobs that record paperIdScheme "row_index" always used the row number, so any 'id' column must be ignored.
   const firstRow = originalCsvData[0] || {};
-  const hasIdColumn = Object.keys(firstRow).some(key => key.toLowerCase() === 'id');
+  const usesRowIndex = job.options?.paperIdScheme === "row_index";
+  const hasIdColumn = !usesRowIndex && Object.keys(firstRow).some(key => key.toLowerCase() === 'id');
   const idColumnKey = hasIdColumn ? Object.keys(firstRow).find(key => key.toLowerCase() === 'id') : null;
   
   console.log("🔍 [CSV Export] ID column detection:", { hasIdColumn, idColumnKey });
@@ -348,7 +350,8 @@ export async function downloadCSV(jobId: number, onlyProcessed?: boolean): Promi
       "design": "Design",
       "method": "Method",
       "flags": "Flags",
-      "reason_for_flags": "Reasons"
+      "reason_for_flags": "Reasons",
+      "reasons_for_flags": "Reasons"
     };
     
     // Track which custom field keys we've seen to avoid duplicates

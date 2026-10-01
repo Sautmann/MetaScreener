@@ -5,7 +5,7 @@ import pdfjsLib from "./pdfjs";
 
 /**
  * Utility functions for handling PDF files and matching them to CSV entries
- * Uses SequenceMatcher-like algorithm for title matching and DOI fallback
+ * Uses SequenceMatcher-like algorithm for title matching and exact DOI matching
  * Powered by PDF.js for actual PDF processing
  */
 
@@ -21,22 +21,24 @@ function sequenceMatcherRatio(str1: string, str2: string): number {
 
     if (s1 === s2) return 1.0;
 
-    // Longest Common Subsequence implementation
+    // Longest Common Subsequence, keeping only two rows of the DP table
     const m = s1.length;
     const n = s2.length;
-    const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    let prev = new Uint16Array(n + 1);
+    let curr = new Uint16Array(n + 1);
 
     for (let i = 1; i <= m; i++) {
         for (let j = 1; j <= n; j++) {
             if (s1[i - 1] === s2[j - 1]) {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
+                curr[j] = prev[j - 1] + 1;
             } else {
-                dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+                curr[j] = Math.max(prev[j], curr[j - 1]);
             }
         }
+        [prev, curr] = [curr, prev];
     }
 
-    const matches = dp[m][n];
+    const matches = prev[n];
     return (2.0 * matches) / (m + n);
 }
 
@@ -92,7 +94,7 @@ export async function extractPdfData(file: File): Promise<PDFData> {
     // Use PDF.js to extract metadata from the PDF file
     const loadingTask = pdfjsLib.getDocument(arrayBuffer);
     let pdf: PDFDocumentProxy;
-    
+
     try {
         pdf = await loadingTask.promise;
         const pdfMetadata = await getMetaData(pdf);
@@ -110,10 +112,10 @@ export async function extractPdfData(file: File): Promise<PDFData> {
         }
         metadata.title = pdfMetadata.title || fileName;
         const result = { ...metadata, ...pdfMetadata, filename: fileName, fulltext: await extractFullText(pdf) };
-        
+
         // Clean up the PDF document to free memory and workers
         pdf.destroy();
-        
+
         return result;
     } catch (error) {
         // Clean up on error
@@ -125,9 +127,10 @@ export async function extractPdfData(file: File): Promise<PDFData> {
 }
 
 async function findDoiInText(text: string): Promise<string | undefined> {
-    const doiRegex = /10.\d{4,9}\/[-._;()/:A-Z0-9]+/i;
+    const doiRegex = /10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i;
     const match = text.match(doiRegex);
-    return match ? match[0] : undefined;
+    // Trailing punctuation is almost always sentence/bracket context, not part of the DOI
+    return match ? match[0].replace(/[.,;:)]+$/, '') : undefined;
 }
 
 
@@ -147,11 +150,44 @@ export async function extractFullText(pdf: PDFDocumentProxy): Promise<string> {
     for (let i = 1; i <= numPages; i++) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
-        const pageText = textContent.items.map((item: any) => item.str).join(' ');
+        // Keep the PDF's own line breaks so headings (e.g. "References") stay on their own line
+        const pageText = textContent.items
+            .map((item: any) => item.str + (item.hasEOL ? '\n' : ' '))
+            .join('')
+            .replace(/[ \t]+\n/g, '\n');
         fullText += pageText + '\n';
     }
 
     return fullText.trim();
+}
+
+const REFERENCES_HEADING = /\n[ \t]*(?:\d+\.?[ \t]*)?(references|bibliography|works cited|literature cited|reference list)[ \t]*\n/gi;
+const POST_REFERENCES_HEADING = /\n[ \t]*(?:[A-Z]\.?[ \t]*)?(appendix|appendices|online appendix|supplementary (?:material|information|appendix)|annex)\b[^\n]{0,80}\n/i;
+
+/**
+ * Remove the reference list from extracted full text to save tokens.
+ * Only cuts a "References"-style heading found in the second half of the document,
+ * and keeps any appendix that follows it.
+ */
+export function stripReferences(text: string): string {
+    if (!text) return text;
+    let cut = -1;
+    for (const match of text.matchAll(REFERENCES_HEADING)) {
+        if (match.index !== undefined && match.index > text.length * 0.5) {
+            cut = match.index;
+        }
+    }
+    if (cut < 0) return text;
+
+    const afterRefs = text.slice(cut + 1);
+    const appendix = afterRefs.search(POST_REFERENCES_HEADING);
+    const kept = text.slice(0, cut);
+    return appendix >= 0 ? kept + '\n' + afterRefs.slice(appendix) : kept;
+}
+
+/** Rough token estimate (~4 characters per token for English text) */
+export function estimateTokens(text: string | undefined): number {
+    return text ? Math.ceil(text.length / 4) : 0;
 }
 
 /**
@@ -167,7 +203,7 @@ export async function extractPdfDataBatch(
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
         onProgress?.(i + 1, files.length, file.name);
-        
+
         try {
             const pdfData = await extractPdfData(file);
             console.log(`Extracted data for ${file.name}:`, pdfData);
@@ -204,7 +240,7 @@ export interface PDFMatch {
  */
 function normalizeForMatching(str: string): string {
     if (!str) return '';
-    
+
     return str
         .toLowerCase()
         .trim()
@@ -220,138 +256,79 @@ function normalizeForMatching(str: string): string {
 }
 
 /**
- * Normalize DOI strings for comparison
+ * Canonical DOI form used for exact matching: lowercase, URL/"doi:" prefixes removed,
+ * and every run of non-alphanumerics collapsed to "_". This makes "10.1016/j.x.2020.1"
+ * equal to a filename like "10_1016_j_x_2020_1" (as written by the PDF downloader).
  */
-function normalizeDoi(doi: string): string {
+export function canonicalDoi(doi: string | undefined): string {
     if (!doi) return '';
-    
-    return doi
+    let s = doi;
+    try {
+        s = decodeURIComponent(s);
+    } catch {
+        // keep as-is if it is not valid URI encoding
+    }
+    s = s
         .toLowerCase()
         .trim()
-        // Remove common prefixes
-        .replace(/^(doi:|https?:\/\/doi\.org\/|https?:\/\/dx\.doi\.org\/)/i, '')
-        // Remove extra spaces
-        .replace(/\s+/g, '');
+        .replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:\s*)/, '')
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return /^10_\d{4,9}_./.test(s) ? s : '';
 }
 
 /**
- * Calculate match score between PDF data and paper entry
+ * Find a DOI encoded in a filename, e.g. "10_1016_j_jdeveco_2020_102345",
+ * "10.1016_j.jdeveco.2020.102345" or "doi_10_1016_...". Returns the canonical form.
  */
-function calculateMatchScore(pdfData: PDFData, paper: Paper): {
-    score: number;
-    matchType: 'doi' | 'title' | 'filename';
-} {
-    // DOI matching (highest priority)
-    if (pdfData.doi && paper.doi) {
-        const normalizedPdfDoi = normalizeDoi(pdfData.doi);
-        const normalizedPaperDoi = normalizeDoi(paper.doi);
-        
-        if (normalizedPdfDoi && normalizedPaperDoi) {
-            const doiSimilarity = calculateSimilarity(normalizedPdfDoi, normalizedPaperDoi);
-            if (doiSimilarity > 0.9) {
-                return { score: doiSimilarity, matchType: 'doi' };
-            }
-        }
+export function doiFromFilename(filename: string | undefined): string {
+    if (!filename) return '';
+    let s = filename.replace(/\.pdf$/i, '');
+    try {
+        s = decodeURIComponent(s);
+    } catch {
+        // keep as-is
     }
-
-    // Title matching (second priority)
-    if (pdfData.title && paper.title) {
-        const normalizedPdfTitle = normalizeForMatching(pdfData.title);
-        const normalizedPaperTitle = normalizeForMatching(paper.title);
-        
-        if (normalizedPdfTitle && normalizedPaperTitle) {
-            const titleSimilarity = calculateSimilarity(normalizedPdfTitle, normalizedPaperTitle);
-            if (titleSimilarity > 0.6) {
-                return { score: titleSimilarity, matchType: 'title' };
-            }
-        }
-    }
-
-    // Filename matching (fallback)
-    if (pdfData.filename && paper.title) {
-        const normalizedFilename = normalizeForMatching(pdfData.filename);
-        const normalizedPaperTitle = normalizeForMatching(paper.title);
-        
-        if (normalizedFilename && normalizedPaperTitle) {
-            const filenameSimilarity = calculateSimilarity(normalizedFilename, normalizedPaperTitle);
-            if (filenameSimilarity > 0.5) {
-                return { score: filenameSimilarity, matchType: 'filename' };
-            }
-        }
-    }
-
-    return { score: 0, matchType: 'filename' };
+    const canon = s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const match = canon.match(/(?:^|_)(10_\d{4,9}_.+)$/);
+    return match ? match[1] : '';
 }
 
-/**
- * Match PDF files to papers using intelligent scoring - memory efficient version
- * Returns matches with indices instead of copying data objects
- */
-export function matchPdfsToPapers(
-    pdfDataList: PDFData[],
-    papers: Paper[],
-    minConfidence: number = 0.5,
-    onProgress?: (current: number, total: number, pdfName: string) => void
-): PDFMatch[] {
-    const matches: PDFMatch[] = [];
-    const usedPaperIndices = new Set<number>();
+const CHAR_SLOTS = 128;
 
-    // Create array of potential matches with indices only
-    const potentialMatches: Array<{
-        pdfIndex: number;
-        paperIndex: number;
-        score: number;
-        matchType: 'doi' | 'title' | 'filename';
-    }> = [];
-
-    // Generate all potential matches
-    for (let pdfIndex = 0; pdfIndex < pdfDataList.length; pdfIndex++) {
-        const pdfData = pdfDataList[pdfIndex];
-        
-        for (let paperIndex = 0; paperIndex < papers.length; paperIndex++) {
-            const paper = papers[paperIndex];
-            const { score, matchType } = calculateMatchScore(pdfData, paper);
-            
-            if (score >= minConfidence) {
-                potentialMatches.push({
-                    pdfIndex,
-                    paperIndex,
-                    score,
-                    matchType
-                });
-            }
-        }
-        onProgress?.(pdfIndex + 1, pdfDataList.length, pdfData?.filename || `PDF ${pdfIndex + 1}`);
+function charProfile(str: string): Uint16Array {
+    const counts = new Uint16Array(CHAR_SLOTS);
+    for (let i = 0; i < str.length; i++) {
+        counts[str.charCodeAt(i) & (CHAR_SLOTS - 1)]++;
     }
-
-    // Sort by confidence (highest first)
-    potentialMatches.sort((a, b) => b.score - a.score);
-
-    // Select best non-conflicting matches
-    const usedPdfIndices = new Set<number>();
-    
-    for (const potentialMatch of potentialMatches) {
-        if (!usedPdfIndices.has(potentialMatch.pdfIndex) && 
-            !usedPaperIndices.has(potentialMatch.paperIndex)) {
-            
-            matches.push({
-                pdfIndex: potentialMatch.pdfIndex,
-                paperIndex: potentialMatch.paperIndex,
-                confidence: potentialMatch.score,
-                matchType: potentialMatch.matchType
-            });
-            
-            usedPdfIndices.add(potentialMatch.pdfIndex);
-            usedPaperIndices.add(potentialMatch.paperIndex);
-        }
-    }
-
-    return matches;
+    return counts;
 }
 
+/** Cheap upper bound on sequenceMatcherRatio (like SequenceMatcher.quick_ratio) */
+function quickRatio(a: Uint16Array, aLen: number, b: Uint16Array, bLen: number): number {
+    if (aLen + bLen === 0) return 0;
+    let common = 0;
+    for (let i = 0; i < CHAR_SLOTS; i++) {
+        common += Math.min(a[i], b[i]);
+    }
+    return (2.0 * common) / (aLen + bLen);
+}
+
+function titleWords(normalized: string): Set<string> {
+    return new Set(normalized.split(/[\s_]+/).filter(w => w.length >= 3));
+}
+
+const TITLE_THRESHOLD = 0.6;
+// Titles that clear the character-level thresholds share a good part of their words;
+// pairs below this word overlap are skipped without running the LCS.
+const MIN_WORD_DICE = 0.4;
+const FILENAME_THRESHOLD = 0.5;
+
 /**
- * Non-blocking version of matchPdfsToPapers using async/await with periodic yielding
- * Prevents UI blocking by yielding control back to the event loop periodically
+ * Match PDF files to papers without blocking the UI.
+ * 1. Exact DOI match (PDF metadata / first-page DOI, or a DOI encoded in the filename)
+ * 2. Fuzzy match of PDF title and filename against the paper title (best of the two)
+ * Each PDF and each paper is used at most once; highest-confidence pairs win.
  */
 export async function matchPdfsToPapersAsync(
     pdfDataList: PDFData[],
@@ -359,10 +336,36 @@ export async function matchPdfsToPapersAsync(
     minConfidence: number = 0.5,
     onProgress?: (current: number, total: number, pdfName: string) => void
 ): Promise<PDFMatch[]> {
-    const matches: PDFMatch[] = [];
-    const usedPaperIndices = new Set<number>();
+    // Yield to the event loop by elapsed time rather than per comparison count
+    let lastYield = performance.now();
+    const maybeYield = async () => {
+        if (performance.now() - lastYield > 30) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            lastYield = performance.now();
+        }
+    };
 
-    // Create array of potential matches with indices only
+    // Precompute per-paper lookup data once
+    const doiIndex = new Map<string, number[]>();
+    const wordIndex = new Map<string, number[]>();
+    const paperTitles = papers.map((paper, paperIndex) => {
+        const doi = canonicalDoi(paper.doi);
+        if (doi) {
+            const list = doiIndex.get(doi) ?? [];
+            list.push(paperIndex);
+            doiIndex.set(doi, list);
+        }
+        const title = normalizeForMatching(paper.title);
+        const words = titleWords(title);
+        for (const word of words) {
+            const list = wordIndex.get(word) ?? [];
+            list.push(paperIndex);
+            wordIndex.set(word, list);
+        }
+        return { title, profile: charProfile(title), wordCount: words.size };
+    });
+    const allPaperIndices = papers.map((_, i) => i);
+
     const potentialMatches: Array<{
         pdfIndex: number;
         paperIndex: number;
@@ -370,54 +373,110 @@ export async function matchPdfsToPapersAsync(
         matchType: 'doi' | 'title' | 'filename';
     }> = [];
 
-    // Helper function to yield control back to the event loop
-    const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
-
-    // Generate all potential matches with periodic yielding
     for (let pdfIndex = 0; pdfIndex < pdfDataList.length; pdfIndex++) {
         const pdfData = pdfDataList[pdfIndex];
-        
-        for (let paperIndex = 0; paperIndex < papers.length; paperIndex++) {
-            const paper = papers[paperIndex];
-            const { score, matchType } = calculateMatchScore(pdfData, paper);
-            
-            if (score >= minConfidence) {
-                potentialMatches.push({
-                    pdfIndex,
-                    paperIndex,
-                    score,
-                    matchType
-                });
-            }
-            // Yield every 100 comparisons to prevent blocking
-            if ((pdfIndex * papers.length + paperIndex) % 100 === 0) {
-                await yieldToEventLoop();
+
+        // 1. Exact DOI matches
+        const pdfDois = new Set(
+            [canonicalDoi(pdfData.doi), doiFromFilename(pdfData.filename)].filter(Boolean)
+        );
+        let doiMatched = false;
+        for (const doi of pdfDois) {
+            for (const paperIndex of doiIndex.get(doi) ?? []) {
+                potentialMatches.push({ pdfIndex, paperIndex, score: 1.0, matchType: 'doi' });
+                doiMatched = true;
             }
         }
-        
+
+        // 2. Fuzzy title / filename matching
+        if (!doiMatched) {
+            const pdfTitle = normalizeForMatching(pdfData.title || '');
+            const pdfFilename = normalizeForMatching(pdfData.filename || '');
+            const candidates = [
+                { text: pdfTitle, threshold: TITLE_THRESHOLD, matchType: 'title' as const },
+                { text: pdfFilename, threshold: FILENAME_THRESHOLD, matchType: 'filename' as const },
+            ]
+                .filter(c => c.text)
+                .map(c => ({
+                    ...c,
+                    threshold: Math.max(c.threshold, minConfidence),
+                    profile: charProfile(c.text),
+                    words: titleWords(c.text),
+                }));
+
+            // Shared-word counts per paper for each candidate text, via the inverted index.
+            // Texts with fewer than 3 words (e.g. "CashTransfersKenya2020") get a full scan instead.
+            let needsFullScan = false;
+            const sharedWords = candidates.map(c => {
+                if (c.words.size < 3) {
+                    needsFullScan = true;
+                    return null;
+                }
+                const counts = new Map<number, number>();
+                for (const word of c.words) {
+                    for (const paperIndex of wordIndex.get(word) ?? []) {
+                        counts.set(paperIndex, (counts.get(paperIndex) ?? 0) + 1);
+                    }
+                }
+                return counts;
+            });
+            const paperIndicesToCheck = needsFullScan
+                ? allPaperIndices
+                : [...new Set(sharedWords.flatMap(counts => [...(counts?.keys() ?? [])]))];
+
+            let checked = 0;
+            for (const paperIndex of paperIndicesToCheck) {
+                const paperTitle = paperTitles[paperIndex];
+                if (!paperTitle.title) continue;
+
+                let best: { score: number; matchType: 'title' | 'filename' } | null = null;
+                for (let ci = 0; ci < candidates.length; ci++) {
+                    const c = candidates[ci];
+                    const counts = sharedWords[ci];
+                    if (counts) {
+                        const dice = (2 * (counts.get(paperIndex) ?? 0)) / (c.words.size + paperTitle.wordCount);
+                        if (dice < MIN_WORD_DICE) continue;
+                    }
+                    // Skip the expensive LCS when even the upper bound can't beat the threshold
+                    const bound = quickRatio(c.profile, c.text.length, paperTitle.profile, paperTitle.title.length);
+                    if (bound <= c.threshold || (best && bound <= best.score)) continue;
+                    const score = sequenceMatcherRatio(c.text, paperTitle.title);
+                    if (score > c.threshold && (!best || score > best.score)) {
+                        best = { score, matchType: c.matchType };
+                    }
+                }
+                if (best) {
+                    potentialMatches.push({ pdfIndex, paperIndex, ...best });
+                }
+                if (++checked % 500 === 0) {
+                    await maybeYield();
+                }
+            }
+        }
+
         onProgress?.(pdfIndex + 1, pdfDataList.length, pdfData?.filename || `PDF ${pdfIndex + 1}`);
-        
-        // Yield after processing each PDF
-        await yieldToEventLoop();
+        await maybeYield();
     }
 
     // Sort by confidence (highest first)
     potentialMatches.sort((a, b) => b.score - a.score);
 
     // Select best non-conflicting matches
+    const matches: PDFMatch[] = [];
     const usedPdfIndices = new Set<number>();
-    
+    const usedPaperIndices = new Set<number>();
+
     for (const potentialMatch of potentialMatches) {
-        if (!usedPdfIndices.has(potentialMatch.pdfIndex) && 
+        if (!usedPdfIndices.has(potentialMatch.pdfIndex) &&
             !usedPaperIndices.has(potentialMatch.paperIndex)) {
-            
+
             matches.push({
                 pdfIndex: potentialMatch.pdfIndex,
                 paperIndex: potentialMatch.paperIndex,
                 confidence: potentialMatch.score,
                 matchType: potentialMatch.matchType
             });
-            
+
             usedPdfIndices.add(potentialMatch.pdfIndex);
             usedPaperIndices.add(potentialMatch.paperIndex);
         }
@@ -432,8 +491,8 @@ export async function matchPdfsToPapersAsync(
  * Use this when you need to access the actual data
  */
 export function getMatchData(
-    match: PDFMatch, 
-    pdfDataList: PDFData[], 
+    match: PDFMatch,
+    pdfDataList: PDFData[],
     papers: Paper[]
 ): { pdfData: PDFData; paper: Paper } {
     return {

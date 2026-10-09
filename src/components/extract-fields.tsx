@@ -18,12 +18,12 @@ import { useCustomFields } from "@/hooks/use-custom-fields";
 import { processBatch } from "@/lib/batch-processor";
 import { addFile } from "@/lib/files-manager";
 import { createJob, updateJob } from "@/lib/job-manager";
-import { extractPdfDataBatch, matchPdfsToPapersAsync, PDFMatch } from "@/lib/pdf-utils";
+import { estimateTokens, extractPdfDataBatch, matchPdfsToPapersAsync, PDFMatch, stripReferences } from "@/lib/pdf-utils";
 import { cn, downloadFile } from "@/lib/utils";
 import { Paper, PDFData,PaperWithFields } from "@/types";
 import { Check, ChevronsUpDown, Download, Eye, Loader2, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import Papa from "papaparse";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { createSystemPrompt, DEFAULT_MAX_COMPLETION_TOKENS, DEFAULT_TEMPERATURE, listAvailableModels } from "@/lib/openai-service";
 import SystemPromptViewer from "./SystemPromptViewer";
@@ -45,6 +45,7 @@ export default function ExtractFields() {
   };
   const [file, setFile] = useState<File | null>(null);
   const [fileErrors, setFileErrors] = useState<string[]>([]);
+  const currentCsvFile = file;
   const [pdfFolder, setPdfFolder] = useState<FileList | null>(null);
   const [pdfData, setPdfData] = useState<Array<PDFData>>([]);
   const [extractDesign, setExtractDesign] = useState(true);
@@ -57,6 +58,7 @@ export default function ExtractFields() {
   const [isMatching, setIsMatching] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadJsonl, setDownloadJsonl] = useState(false);
+  const [removeReferences, setRemoveReferences] = useState(true);
   const [temperature, setTemperature] = useState(String(DEFAULT_TEMPERATURE));
   const [maxCompletionTokens, setMaxCompletionTokens] = useState(String(DEFAULT_MAX_COMPLETION_TOKENS));
   const [systemPromptOverride, setSystemPromptOverride] = useState<string | undefined>(undefined);
@@ -169,7 +171,7 @@ export default function ExtractFields() {
               // If we have PDFs selected, try to match them
               if (pdfFolder && pdfFolder.length > 0) {
                 try {
-                  await performMatching((a) => setIsMatching(a));
+                  await performMatching((a) => setIsMatching(a), undefined, selectedFile);
                 } catch (error) {
                   console.error("Error during matching:", error);
                   const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -242,7 +244,9 @@ export default function ExtractFields() {
     }
   };
 
-  const performMatching = async (isProcessing: (a: boolean) => void, pdfDataToUse?: PDFData[]) => {
+  const performMatching = async (isProcessing: (a: boolean) => void, pdfDataToUse?: PDFData[], csvFile?: File) => {
+    // csvFile is passed when called right after setFile(), before state has updated
+    const file = csvFile ?? currentCsvFile;
     if (!file) {
       console.error("No CSV file selected for matching");
       return;
@@ -272,7 +276,6 @@ export default function ExtractFields() {
 
       try {
         const csvData = await readCsvAsText(file);
-        // take first 2000 rows for testing
         const tempResults = await new Promise<Papa.ParseResult<any>>(
           (resolve, reject) => {
             Papa.parse(csvData, {
@@ -283,7 +286,7 @@ export default function ExtractFields() {
             });
           }
         );
-        const papers = (tempResults.data.slice(0, 2000) as any[]).map((row, index) => {
+        const papers = (tempResults.data as any[]).map((row, index) => {
           const normalizedRow: { [key: string]: string } = {};
           Object.keys(row).forEach(key => {
             normalizedRow[key.toLowerCase()] = row[key] || "";
@@ -465,13 +468,16 @@ export default function ExtractFields() {
           temperature: parsedTemperature,
           max_completion_tokens: parsedMaxTokens,
           systemPromptOverride,
+          paperIdScheme: "row_index",
         }
       });
 
       try {
         await addFile(job.id, file, file.name);
         const pdfParams = mode === "fulltext" ? {
-          pdfData: Array.from(pdfData),
+          pdfData: removeReferences
+            ? pdfData.map((pdf) => ({ ...pdf, fulltext: stripReferences(pdf.fulltext || "") }))
+            : Array.from(pdfData),
           matches: pdfMatches,
         } : undefined;
         await processBatch.start(job.id, papers, pdfParams);
@@ -489,6 +495,8 @@ export default function ExtractFields() {
           toast.error("OpenAI API key not configured or invalid. Please check Settings.");
         } else if (errorMessage.includes("No papers with full text")) {
           toast.error("No papers have matching PDFs with full text. Please check your PDF files and matching results.");
+        } else if (errorMessage.includes("recheck settings")) {
+          toast.error(`${errorMessage} Adjust the Recheck options on your custom fields.`);
         } else if (errorMessage.includes("quota") || errorMessage.includes("rate limit")) {
           toast.error("OpenAI API quota exceeded or rate limit reached. Please try again later or check your OpenAI account.");
         } else if (errorMessage.includes("network") || errorMessage.includes("fetch")) {
@@ -509,6 +517,22 @@ export default function ExtractFields() {
       setIsSubmitting(false);
     }
   };
+  // Summary of what full-text mode will actually send
+  const fulltextStats = useMemo(() => {
+    const matchedWithoutText = pdfMatches
+      .map((match) => pdfData[match.pdfIndex])
+      .filter((pdf) => pdf && !pdf.fulltext?.trim());
+    const tokensPerModel = pdfMatches.reduce((sum, match) => {
+      const text = pdfData[match.pdfIndex]?.fulltext || "";
+      return sum + estimateTokens(removeReferences ? stripReferences(text) : text);
+    }, 0);
+    return {
+      matchedWithoutText,
+      tokensPerModel,
+      totalTokens: tokensPerModel * Math.max(selectedModels.length, 1),
+    };
+  }, [pdfMatches, pdfData, removeReferences, selectedModels.length]);
+
   const downloadUnmatchedPdfs = () => {
     if (!pdfData || pdfData.length === 0) {
       toast.error("No PDF's to download");
@@ -516,11 +540,19 @@ export default function ExtractFields() {
     }
     const matchedIndexes = new Set(pdfMatches.map(match => match.pdfIndex));
     const unmatchedPdfsFileNames = pdfData.filter((_, index) => !matchedIndexes.has(index)).map(pdf => pdf.filename);
-    if (unmatchedPdfsFileNames.length === 0) {
+    const noTextFileNames = fulltextStats.matchedWithoutText.map(pdf => pdf.filename);
+    if (unmatchedPdfsFileNames.length === 0 && noTextFileNames.length === 0) {
       toast.info("All PDFs are matched.");
       return;
     }
-    downloadFile("unmatched_pdfs.txt", unmatchedPdfsFileNames.join("\n"), "text/plain");
+    const sections = [];
+    if (unmatchedPdfsFileNames.length > 0) {
+      sections.push(`# Not matched to any CSV row (${unmatchedPdfsFileNames.length})`, ...unmatchedPdfsFileNames, "");
+    }
+    if (noTextFileNames.length > 0) {
+      sections.push(`# Matched, but no extractable text - likely scanned or protected; will be skipped (${noTextFileNames.length})`, ...noTextFileNames);
+    }
+    downloadFile("unmatched_pdfs.txt", sections.join("\n"), "text/plain");
   };
 
   return (
@@ -776,8 +808,16 @@ export default function ExtractFields() {
                 {pdfFolder.length} PDF files selected and processed
               </p>
             )}
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="removeReferences"
+                checked={removeReferences}
+                onCheckedChange={(checked) => setRemoveReferences(checked === true)}
+              />
+              <Label htmlFor="removeReferences" className="text-sm">Remove reference lists from full text (saves tokens, keeps appendices)</Label>
+            </div>
             <HelpText 
-              text="Select a folder containing PDF files. Files will be matched to CSV entries using metadata extracted from PDFs."
+              text="Select a folder containing PDF files. Files are matched to CSV rows by DOI (PDF metadata, first page, or a DOI filename such as 10_1016_j_xyz_2020_1.pdf), then by title or filename."
               linkTo="/#/manual#extract-fields"
               linkText="Learn more about PDF matching"
               className="mt-1"
@@ -823,10 +863,21 @@ export default function ExtractFields() {
               {pdfMatches.length > 0 && (
                 <div className="text-xs text-muted-foreground">
                   Matched: {pdfMatches.length} out of {pdfData.length} PDFs
+                  {" · "}≈{fulltextStats.tokensPerModel.toLocaleString()} input tokens per model
+                </div>
+              )}
+              {fulltextStats.matchedWithoutText.length > 0 && (
+                <div className="text-xs text-amber-600">
+                  {fulltextStats.matchedWithoutText.length} matched PDFs have no extractable text (scanned or protected?) and will be skipped.
+                </div>
+              )}
+              {fulltextStats.totalTokens > 1_000_000 && (
+                <div className="text-xs text-amber-600">
+                  Large job (≈{fulltextStats.totalTokens.toLocaleString()} tokens across all models). OpenAI limits how many batch tokens can be queued per model; if a batch fails right away, split the CSV into smaller jobs.
                 </div>
               )}
               {/* Button to download unmatched PDFs list */}
-              {pdfMatches.length < pdfData.length && (
+              {(pdfMatches.length < pdfData.length || fulltextStats.matchedWithoutText.length > 0) && (
                 <Button
                   type="button"
                   variant="outline"

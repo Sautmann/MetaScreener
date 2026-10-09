@@ -27,6 +27,8 @@ export interface AIOptions {
   downloadJsonl?: boolean;
   temperature?: number;
   max_completion_tokens?: number;
+  /** "row_index": request ids are the 1-based CSV row number. Older jobs may have used the CSV's own id column. */
+  paperIdScheme?: "row_index";
 }
 
 export interface CustomField{

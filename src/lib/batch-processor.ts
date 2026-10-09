@@ -13,13 +13,18 @@ export const processBatch = {
     if (!job) {
       throw new Error("Job not found");
     }
+    let filteredPapers: PaperWithFields[] = papers;
     if (pdfParams){
       addFullTextToPapers(papers, pdfParams);
-    }
-    // if pdfParams is provided, use only papers with full text
-    const filteredPapers = pdfParams ? papers.filter(paper => paper.fulltext && isPaperIncluded(paper, job.fields.custom)) : papers;
-    if (filteredPapers.length === 0) {
-      throw new Error("No papers with full text found for batch processing.");
+      // if pdfParams is provided, use only papers with full text
+      const papersWithText = papers.filter(paper => paper.fulltext?.trim());
+      if (papersWithText.length === 0) {
+        throw new Error("No papers with full text found for batch processing.");
+      }
+      filteredPapers = papersWithText.filter(paper => isPaperIncluded(paper, job.fields.custom));
+      if (filteredPapers.length === 0) {
+        throw new Error(`All ${papersWithText.length} papers with full text were skipped by the recheck settings.`);
+      }
     }
     // Determine models to use (multi-model support)
     const models: string[] = (job.options?.models && job.options.models.length > 0)

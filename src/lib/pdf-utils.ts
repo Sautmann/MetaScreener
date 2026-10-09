@@ -162,12 +162,14 @@ export async function extractFullText(pdf: PDFDocumentProxy): Promise<string> {
 }
 
 const REFERENCES_HEADING = /\n[ \t]*(?:\d+\.?[ \t]*)?(references|bibliography|works cited|literature cited|reference list)[ \t]*\n/gi;
-const POST_REFERENCES_HEADING = /\n[ \t]*(?:[A-Z]\.?[ \t]*)?(appendix|appendices|online appendix|supplementary (?:material|information|appendix)|annex)\b[^\n]{0,80}\n/i;
+// Content that commonly follows the reference list and must be kept: appendices, and the
+// tables/figures that author manuscripts and some journals place after the references.
+const POST_REFERENCES_HEADING = /\n[ \t]*(?:(?:[A-Z]\.?[ \t]*)?(appendix|appendices|online appendix|supplementary (?:material|information|appendix)|annex)\b[^\n]{0,80}\n|(?:supplementary[ \t]+|supplemental[ \t]+)?(table|fig\.?|figure)[ \t]*[A-Z]?\d+[.:\s])/i;
 
 /**
  * Remove the reference list from extracted full text to save tokens.
  * Only cuts a "References"-style heading found in the second half of the document,
- * and keeps any appendix that follows it.
+ * and keeps everything from the first appendix, table or figure that follows it.
  */
 export function stripReferences(text: string): string {
     if (!text) return text;

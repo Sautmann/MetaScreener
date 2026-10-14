@@ -5,6 +5,7 @@ import { getFilesByJobId } from "./files-manager";
 import { getJob } from "./job-manager";
 import { firstValueTokenLogprobByKey } from "./logprob";
 import { createSystemPrompt, getBatchResults, nameToKey } from "./openai-service";
+import { isSyncJob, syncProcessor } from "./sync-processor";
 import { downloadFile } from "./utils";
 
 
@@ -84,8 +85,10 @@ export async function downloadCSV(jobId: number, onlyProcessed?: boolean): Promi
     throw new Error("No original CSV file found for this job");
   }
   
-  // Assume the first file is the CSV file
-  const originalFile = files[0];
+  // The uploaded CSV is stored first; synchronous full-text jobs also store their PDFs here
+  const originalFile = files.find((f) => f.filename === job.filename)
+    ?? files.find((f) => /\.csv$/i.test(f.filename))
+    ?? files[0];
   console.log("📄 [CSV Export] Using original file:", { id: originalFile.id, filename: originalFile.filename });
 
   if (!originalFile.file) {
@@ -148,7 +151,9 @@ export async function downloadCSV(jobId: number, onlyProcessed?: boolean): Promi
     
     // Get extraction results from OpenAI batch
     console.log("📥 [CSV Export] Fetching batch results from OpenAI...", { batchId });
-    const results = await getBatchResults(batchId);
+    const results = isSyncJob(job)
+      ? await syncProcessor.getResults(jobId, model)
+      : await getBatchResults(batchId);
     console.log("📊 [CSV Export] Batch results retrieved", {
       batchId,
       resultCount: results.length,

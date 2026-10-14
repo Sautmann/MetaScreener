@@ -244,6 +244,118 @@ const getAIOptions = (options?: AIOptions) => {
     presence_penalty: 0,
   };
 }
+/** Message content for a PDF attached to a chat completion request */
+export type PdfAttachment = { filename: string; dataUrl: string };
+
+/**
+ * Body of a /v1/chat/completions request for one paper. Shared by batch and synchronous
+ * processing so both send exactly the same prompt and parameters.
+ */
+export function buildChatRequestBody(
+  systemPrompt: string,
+  userPrompt: string,
+  options: AIOptions = {},
+  pdf?: PdfAttachment
+) {
+  const userContent = pdf
+    ? [
+        { type: "file" as const, file: { filename: pdf.filename, file_data: pdf.dataUrl } },
+        { type: "text" as const, text: userPrompt },
+      ]
+    : userPrompt;
+  return {
+    messages: [
+      { role: "system" as const, content: systemPrompt },
+      { role: "user" as const, content: userContent },
+    ],
+    response_format: { type: "json_object" as const },
+    ...getAIOptions(options),
+  };
+}
+
+export function resolveSystemPrompt(
+  fields: { design: boolean; method: boolean; custom: Array<CustomField> },
+  options: AIOptions = {}
+): string {
+  return options.systemPromptOverride?.trim()?.length ? options.systemPromptOverride! : createSystemPrompt(fields);
+}
+
+/** Read a PDF blob as a data URL for the file_data content part */
+export function blobToPdfDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result);
+      // Normalise the MIME type; Files from a folder picker are sometimes typed as octet-stream
+      resolve(result.replace(/^data:[^;]*;base64,/, "data:application/pdf;base64,"));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Run one chat completion directly (synchronous mode). SDK retries are off: the caller's rate
+ * limiter pauses all parallel requests together on 429 instead of each retrying on its own.
+ * Response headers are returned so x-ratelimit-* values can be used when the browser exposes them.
+ */
+export async function createChatCompletion(
+  body: ReturnType<typeof buildChatRequestBody>,
+  signal?: AbortSignal
+) {
+  const openai = getOpenAIClient();
+  const { data, response } = await openai.chat.completions
+    .create(
+      { ...body, stream: false } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+      { signal, maxRetries: 0 }
+    )
+    .withResponse();
+  return { completion: data, headers: response.headers };
+}
+
+export type RequestErrorKind =
+  | "rate_limit" // 429: wait and retry
+  | "quota" // 429 insufficient_quota: out of credit, stop the job
+  | "too_large" // request can never fit the token limit / context window
+  | "transient" // 5xx, timeouts, network errors: retry with backoff
+  | "fatal_auth" // bad API key or permissions: stop the job
+  | "aborted"
+  | "other"; // 4xx bad request etc.: fail this request
+
+/** Classify an error from createChatCompletion and extract retry-after if present */
+export function classifyRequestError(error: unknown): { kind: RequestErrorKind; retryAfterMs?: number; message: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof OpenAI.APIUserAbortError || (error instanceof DOMException && error.name === "AbortError")) {
+    return { kind: "aborted", message };
+  }
+  if (error instanceof OpenAI.APIConnectionError) {
+    return { kind: "transient", message };
+  }
+  if (error instanceof OpenAI.APIError) {
+    const headers = error.headers ?? {};
+    const retryAfterMsHeader = Number(headers["retry-after-ms"]);
+    const retryAfterHeader = Number(headers["retry-after"]);
+    const retryAfterMs = Number.isFinite(retryAfterMsHeader) && retryAfterMsHeader > 0
+      ? retryAfterMsHeader
+      : Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader * 1000 : undefined;
+    const lower = message.toLowerCase();
+    if (error.status === 429) {
+      if (error.code === "insufficient_quota" || lower.includes("quota")) return { kind: "quota", message };
+      if (lower.includes("request too large") || lower.includes("too large")) return { kind: "too_large", message };
+      return { kind: "rate_limit", retryAfterMs, message };
+    }
+    if (error.status === 401 || error.status === 403) return { kind: "fatal_auth", message };
+    if (error.status === 400 && (error.code === "context_length_exceeded" || lower.includes("maximum context length"))) {
+      return { kind: "too_large", message };
+    }
+    if (error.status === 408 || error.status === 409 || (error.status !== undefined && error.status >= 500)) {
+      return { kind: "transient", retryAfterMs, message };
+    }
+    return { kind: "other", message };
+  }
+  return { kind: "other", message };
+}
+
 export async function createBatch(
   papers: Paper[],
   fields: {
@@ -255,28 +367,14 @@ export async function createBatch(
 ) {
   try {
     const openai = getOpenAIClient();
-    const systemPrompt = options.systemPromptOverride?.trim()?.length ? options.systemPromptOverride! : createSystemPrompt(fields);
+    const systemPrompt = resolveSystemPrompt(fields, options);
     const aiOptions = getAIOptions(options);
     const requests = papers.map((paper) => {
-      const userPrompt = createUserPrompt(paper);
       return {
         custom_id: `request-${paper.id}`,
         method: "POST",
         url: "/v1/chat/completions",
-        body: {
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt,
-            },
-            {
-              role: "user",
-              content: userPrompt,
-            },
-          ],
-          response_format: { type: "json_object" },
-          ...aiOptions
-        },
+        body: buildChatRequestBody(systemPrompt, createUserPrompt(paper), options),
       };
     });
     const jsonl = requests.map((req) => JSON.stringify(req)).join("\n");
@@ -374,13 +472,16 @@ export async function getBatchResults(batchId: string) {
   }
 }
 
-function createUserPrompt(paper: Paper): string {
+export function createUserPrompt(paper: Paper, options: { pdfAttached?: boolean } = {}): string {
+  const fulltext = options.pdfAttached
+    ? "The full text of the paper is attached as a PDF file."
+    : paper.fulltext || "Fulltext not available";
   return `Paper Title: ${paper.title}\n\n` +
     `Paper Abstract: ${paper.abstract}\n\n` +
     `Paper Authors: ${paper.authors}\n\n` +
     `Paper Keywords: ${paper.keywords}\n\n` +
     `Paper DOI: ${paper.doi}\n\n` +
-    `Paper Fulltext: ${paper.fulltext || "Fulltext not available"}\n\n`
+    `Paper Fulltext: ${fulltext}\n\n`
 }
 export function createSystemPrompt(
   fields: {

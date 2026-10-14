@@ -7,13 +7,14 @@ import { deleteJob, getAllJobs, getJob, createJob } from "@/lib/job-manager";
 import { downloadCSV } from "@/lib/csv-utils";
 import { processBatch } from "@/lib/batch-processor";
 import type { Job } from "@/types";
-import { Download, Trash2, RefreshCw } from "lucide-react";
+import { Download, Trash2, RefreshCw, Play, Square } from "lucide-react";
 import { toast } from "sonner";
 import { cancelBatch } from "@/lib/openai-service";
 import { downloadCustomFields } from "@/hooks/use-custom-fields";
 import { HelpText } from "./help-text";
 import { useNavigate } from "react-router-dom";
 import FeedbackModal from "./feedback-modal";
+import { isSyncJob, syncProcessor } from "@/lib/sync-processor";
 
 export default function JobManagement() {
   const navigate = useNavigate();
@@ -176,12 +177,26 @@ export default function JobManagement() {
     }
   };
 
+  const handleResumeSync = async (jobId: number) => {
+    await syncProcessor.resume(jobId);
+    toast.success("Job resumed. Keep this browser tab open until it finishes.");
+    await loadJobs();
+  };
+
+  const handleStopSync = async (jobId: number) => {
+    syncProcessor.stop(jobId);
+    toast.info("Stopping after the requests already in progress. You can resume later.");
+  };
+
   const handleDeleteJob = async (job: Job) => {
     try {
+      if (isSyncJob(job)) {
+        syncProcessor.stop(job.id);
+      }
       await deleteJob(job.id);
       setJobs(jobs.filter((j) => j.id !== job.id));
       toast.success("Job deleted successfully");
-      if (job.status !== "completed") {
+      if (job.status !== "completed" && !isSyncJob(job)) {
         if (job.batches && job.batches.length > 0) {
           for (const b of job.batches) {
             try { await cancelBatch(b.batchId); } catch {}
@@ -283,6 +298,11 @@ export default function JobManagement() {
         </ol>
       </div>
       {jobs.map((job) => {
+        const sync = isSyncJob(job);
+        const syncRunning = sync && syncProcessor.isRunning(job.id);
+        const syncFailed = (job.batches ?? []).reduce((sum, b) => sum + (b.failed ?? 0), 0);
+        // In-progress synchronous jobs only advance while this tab runs them
+        const syncInterrupted = sync && !syncRunning && ["in_progress", "cancelled", "failed"].includes(job.status);
         const batches = (job.batches && job.batches.length > 0) 
           ? job.batches 
           : job.batchId 
@@ -299,9 +319,37 @@ export default function JobManagement() {
                 </p>
                 <p className="text-sm text-muted-foreground">
                   Mode: {job.mode === "fulltext" ? "Full Text" : "Abstract Only"}
+                  {" · "}
+                  {sync ? (job.mode === "fulltext" ? "Synchronous (PDF files sent)" : "Synchronous") : "Batch"}
                 </p>
+                {syncRunning && (
+                  <p className="text-xs text-blue-600">Running in this tab. Keep it open until the job finishes.</p>
+                )}
+                {sync && job.error && (
+                  <p className="text-xs text-red-600">{job.error}</p>
+                )}
+                {syncInterrupted && (
+                  <p className="text-xs text-amber-600">
+                    {job.status === "in_progress" ? "Interrupted (the tab was closed or reloaded)." : "Stopped."} Resume to continue where it left off.
+                  </p>
+                )}
+                {sync && !syncRunning && job.status === "completed" && syncFailed > 0 && (
+                  <p className="text-xs text-amber-600">
+                    {syncFailed} requests failed. Use "Retry failed" to run them again.
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-2">
+                {syncRunning && (
+                  <Button variant="outline" size="sm" onClick={() => handleStopSync(job.id)}>
+                    <Square className="h-4 w-4 mr-1" /> Stop
+                  </Button>
+                )}
+                {(syncInterrupted || (sync && !syncRunning && job.status === "completed" && syncFailed > 0)) && (
+                  <Button variant="outline" size="sm" onClick={() => handleResumeSync(job.id)}>
+                    <Play className="h-4 w-4 mr-1" /> {syncInterrupted ? "Resume" : "Retry failed"}
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -333,7 +381,7 @@ export default function JobManagement() {
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      {["validating", "in_progress", "finalizing", "canceling", "expired", "canceled", "failed"].includes(batch.status || job.status) && (
+                      {!sync && ["validating", "in_progress", "finalizing", "canceling", "expired", "canceled", "failed"].includes(batch.status || job.status) && (
                         <Button
                           variant="outline"
                           size="sm"
@@ -348,7 +396,7 @@ export default function JobManagement() {
                       <Button
                         variant="outline"
                         size="sm"
-                        disabled={!((batch.status || job.status) === "completed" || batch.output_file_id)}
+                        disabled={!((batch.status || job.status) === "completed" || batch.output_file_id || (sync && (batch.completed ?? 0) > 0))}
                         onClick={() => handleDownloadBatch(job.id, batch.batchId, batch.model, true)}
                       >
                         <Download className="h-4 w-4 mr-1" /> Processed
@@ -356,7 +404,7 @@ export default function JobManagement() {
                       <Button
                         variant="outline"
                         size="sm"
-                        disabled={!((batch.status || job.status) === "completed" || batch.output_file_id)}
+                        disabled={!((batch.status || job.status) === "completed" || batch.output_file_id || (sync && (batch.completed ?? 0) > 0))}
                         onClick={() => handleDownloadBatch(job.id, batch.batchId, batch.model, false)}
                       >
                         <Download className="h-4 w-4 mr-1" /> All
@@ -368,6 +416,9 @@ export default function JobManagement() {
                     <div className="flex justify-between text-sm">
                       <span>
                         Progress: {batch.completed ?? 0} of {batch.total ?? job.total}
+                        {(batch.failed ?? 0) > 0 && (
+                          <span className="text-amber-600"> · {batch.failed} failed</span>
+                        )}
                       </span>
                       <span>
                         {(batch.total ?? job.total) > 0

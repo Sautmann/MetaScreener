@@ -111,7 +111,7 @@ export async function extractPdfData(file: File): Promise<PDFData> {
             }
         }
         metadata.title = pdfMetadata.title || fileName;
-        const result = { ...metadata, ...pdfMetadata, filename: fileName, fulltext: await extractFullText(pdf) };
+        const result = { ...metadata, ...pdfMetadata, filename: fileName, fulltext: await extractFullText(pdf), pages: pdf.numPages };
 
         // Clean up the PDF document to free memory and workers
         pdf.destroy();

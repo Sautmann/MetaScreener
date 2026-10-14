@@ -3,7 +3,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { Separator } from "@/components/ui/separator";
 import { useLocation, useNavigate } from "react-router-dom";
-import { BookOpen, FileText, Settings, Database, Brain, HelpCircle, Download } from "lucide-react";
+import { BookOpen, FileText, Settings, Database, Brain, HelpCircle, Download, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
@@ -256,6 +256,7 @@ export default function Manual() {
       <h2>Table of Contents</h2>
       <div class="toc-item"><a href="#overview">Overview</a></div>
       <div class="toc-item"><a href="#extract-fields">Screen Fields</a></div>
+      <div class="toc-item"><a href="#processing-modes">Processing Modes</a></div>
       <div class="toc-item"><a href="#pdf-download">PDF Download</a></div>
       <div class="toc-item"><a href="#settings">Settings</a></div>
       <div class="toc-item"><a href="#job-management">Job Management</a></div>
@@ -421,6 +422,51 @@ export default function Manual() {
       <li>Processes PDFs in batches to avoid memory issues</li>
       <li>Matches PDFs to CSV rows using fuzzy matching</li>
     </ul>
+  </div>
+
+  <div id="processing-modes" class="section page-break">
+    <h2>Processing Modes: Batch and Synchronous</h2>
+    <h3>How requests are sent to OpenAI</h3>
+    <h4>Choosing a mode</h4>
+    <table>
+        <tr><th></th><th>Batch</th><th>Synchronous</th></tr>
+        <tr><th>Price</th><td>About 50% cheaper</td><td>Standard API price</td></tr>
+        <tr><th>Speed</th><td>Results within 24 hours (often sooner)</td><td>Results as each paper finishes, usually minutes</td></tr>
+        <tr><th>Browser</th><td>Can be closed after starting</td><td>This tab must stay open while the job runs</td></tr>
+        <tr><th>Full text sent as</th><td>Text extracted from the PDF in your browser</td><td>The PDF file itself: OpenAI reads the text and an image of every page</td></tr>
+        <tr><th>Scanned PDFs</th><td>Skipped (no text to extract)</td><td>Screened from the page images</td></tr>
+        <tr><th>Input tokens (full text)</th><td>Lower</td><td>Roughly 2–4× higher (page images)</td></tr>
+    </table>
+    <p>Use <b>Batch</b> for large title/abstract runs and for anything where cost matters more than speed. Use <b>Synchronous</b> for full-text screening where the PDF layout matters: tables, symbols such as ≥, ± and &lt;, multi-column pages, article-type labels (Editorial, Protocol) and scanned papers are read from the page itself instead of from extracted text, which can lose or scramble them. It is also useful for quick pilot runs on a few papers.</p>
+    <h4>Running a synchronous job</h4>
+    <ol>
+      <li>Set your OpenAI API key in Settings.</li>
+      <li>On Screen Fields, choose the screening mode (Title and Abstract, or Full Text) and select one or more models. Full-text PDF input needs a model that accepts images (GPT-4o, GPT-4.1, GPT-5 and later).</li>
+      <li>Under <b>Processing</b>, choose <b>Synchronous</b> and enter your rate limits (see below).</li>
+      <li>Upload the CSV and, for full text, the PDF folder. Check the matching results; the panel shows an estimated token count and how long the job will take at your token limit.</li>
+      <li>Configure fields and click Start Screening. You are taken to Job Management.</li>
+      <li>Keep the tab open. You can switch to other pages of the app, but closing or reloading the tab pauses the job.</li>
+      <li>Download results at any time with Processed or All; papers that have finished are included, the rest stay blank until they are done.</li>
+    </ol>
+    <h4>Setting the rate limits</h4>
+    <p>OpenAI limits every organisation to a number of <b>requests per minute (RPM)</b> and <b>tokens per minute (TPM)</b> for each model. Look yours up at <a href="https://platform.openai.com/settings/organization/limits" target="_blank" rel="noreferrer">platform.openai.com → Settings → Limits</a> and enter the values for the model you selected. The app paces requests so the total stays under both limits, counting each request's prompt, PDF and maximum output tokens, and corrects its estimate using the token counts OpenAI reports back. Each model has its own limit, so several selected models run side by side.</p>
+    <ul>
+      <li>Lower values are always safe, just slower. If you share the API key with other running jobs or people, enter less than your full limit.</li>
+      <li>A full-text PDF is often 10,000–40,000 tokens. With a TPM limit below about 50,000, use 1–2 parallel requests; a single PDF larger than your TPM limit cannot be sent and that paper is reported as failed.</li>
+      <li>Parallel requests (1–16) only controls how many requests are in flight at once; the RPM/TPM pacing applies on top of it. 4 is a good default.</li>
+    </ul>
+    <h4>What happens when something goes wrong</h4>
+    <ul>
+      <li><b>Rate limit reached (429):</b> all requests for that model pause for the time OpenAI asks for (or a growing back-off), then continue. The paper is retried, not marked as failed.</li>
+      <li><b>Server errors, timeouts, network drops:</b> the request is retried a few times with increasing waits.</li>
+      <li><b>Out of credit or invalid API key:</b> the job stops with a message in Job Management. Fix the cause, then click <b>Resume</b>.</li>
+      <li><b>A single paper fails</b> (e.g. PDF over 50 MB, request too large): it is counted as failed and the job continues. When the job finishes, click <b>Retry failed</b> to run only those papers again.</li>
+      <li><b>Tab closed or reloaded:</b> the job shows as Interrupted. Open Job Management and click <b>Resume</b>; finished papers are kept and only the remaining ones are sent.</li>
+    </ul>
+    <h4>Stopping, resuming and deleting</h4>
+    <p><b>Stop</b> finishes the requests already in flight and then pauses the job; <b>Resume</b> continues where it left off. Deleting a job stops it and removes its stored results and PDFs from the browser.</p>
+    <h4>Privacy and storage</h4>
+    <p>In synchronous full-text mode the matched PDF files are sent to OpenAI as part of each request. They are also stored in your browser (IndexedDB) so the job can be resumed, until you delete the job. Nothing is stored on any other server.</p>
   </div>
 
   <div id="pdf-download" class="section page-break">
@@ -869,6 +915,7 @@ export default function Manual() {
           <nav className="space-y-2">
             <a href="#overview" onClick={(e) => { e.preventDefault(); scrollToSection('overview'); }} className="block text-blue-600 hover:underline cursor-pointer">Overview</a>
             <a href="#extract-fields" onClick={(e) => { e.preventDefault(); scrollToSection('extract-fields'); }} className="block text-blue-600 hover:underline cursor-pointer">Screen Fields</a>
+            <a href="#processing-modes" onClick={(e) => { e.preventDefault(); scrollToSection('processing-modes'); }} className="block text-blue-600 hover:underline cursor-pointer">Processing Modes</a>
             <a href="#pdf-download" onClick={(e) => { e.preventDefault(); scrollToSection('pdf-download'); }} className="block text-blue-600 hover:underline cursor-pointer">PDF Download</a>
             <a href="#settings" onClick={(e) => { e.preventDefault(); scrollToSection('settings'); }} className="block text-blue-600 hover:underline cursor-pointer">Settings</a>
             <a href="#job-management" onClick={(e) => { e.preventDefault(); scrollToSection('job-management'); }} className="block text-blue-600 hover:underline cursor-pointer">Job Management</a>
@@ -1108,6 +1155,76 @@ export default function Manual() {
               </AccordionContent>
             </AccordionItem>
           </Accordion>
+        </CardContent>
+      </Card>
+
+      <Separator id="processing-modes" />
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Zap className="h-5 w-5" />
+            Processing Modes: Batch and Synchronous
+          </CardTitle>
+          <CardDescription>How requests are sent to OpenAI</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div>
+            <h3 className="text-lg font-semibold mb-2">Choosing a mode</h3>
+            <div className="overflow-x-auto mb-2">
+              <table className="w-full text-sm border-collapse">
+              <tbody>
+                <tr><th className="text-left p-2 border-b font-semibold"></th><th className="text-left p-2 border-b font-semibold">Batch</th><th className="text-left p-2 border-b font-semibold">Synchronous</th></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Price</th><td className="p-2 border-b align-top text-muted-foreground">About 50% cheaper</td><td className="p-2 border-b align-top text-muted-foreground">Standard API price</td></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Speed</th><td className="p-2 border-b align-top text-muted-foreground">Results within 24 hours (often sooner)</td><td className="p-2 border-b align-top text-muted-foreground">Results as each paper finishes, usually minutes</td></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Browser</th><td className="p-2 border-b align-top text-muted-foreground">Can be closed after starting</td><td className="p-2 border-b align-top text-muted-foreground">This tab must stay open while the job runs</td></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Full text sent as</th><td className="p-2 border-b align-top text-muted-foreground">Text extracted from the PDF in your browser</td><td className="p-2 border-b align-top text-muted-foreground">The PDF file itself: OpenAI reads the text and an image of every page</td></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Scanned PDFs</th><td className="p-2 border-b align-top text-muted-foreground">Skipped (no text to extract)</td><td className="p-2 border-b align-top text-muted-foreground">Screened from the page images</td></tr>
+                <tr><th className="text-left p-2 border-b font-medium align-top">Input tokens (full text)</th><td className="p-2 border-b align-top text-muted-foreground">Lower</td><td className="p-2 border-b align-top text-muted-foreground">Roughly 2–4× higher (page images)</td></tr>
+              </tbody>
+              </table>
+            </div>
+            <p className="text-sm text-muted-foreground mb-2">Use <b>Batch</b> for large title/abstract runs and for anything where cost matters more than speed. Use <b>Synchronous</b> for full-text screening where the PDF layout matters: tables, symbols such as ≥, ± and &lt;, multi-column pages, article-type labels (Editorial, Protocol) and scanned papers are read from the page itself instead of from extracted text, which can lose or scramble them. It is also useful for quick pilot runs on a few papers.</p>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-2">Running a synchronous job</h3>
+            <ol className="list-decimal list-inside ml-4 text-sm text-muted-foreground space-y-1 mb-2">
+              <li>Set your OpenAI API key in Settings.</li>
+              <li>On Screen Fields, choose the screening mode (Title and Abstract, or Full Text) and select one or more models. Full-text PDF input needs a model that accepts images (GPT-4o, GPT-4.1, GPT-5 and later).</li>
+              <li>Under <b>Processing</b>, choose <b>Synchronous</b> and enter your rate limits (see below).</li>
+              <li>Upload the CSV and, for full text, the PDF folder. Check the matching results; the panel shows an estimated token count and how long the job will take at your token limit.</li>
+              <li>Configure fields and click Start Screening. You are taken to Job Management.</li>
+              <li>Keep the tab open. You can switch to other pages of the app, but closing or reloading the tab pauses the job.</li>
+              <li>Download results at any time with Processed or All; papers that have finished are included, the rest stay blank until they are done.</li>
+            </ol>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-2">Setting the rate limits</h3>
+            <p className="text-sm text-muted-foreground mb-2">OpenAI limits every organisation to a number of <b>requests per minute (RPM)</b> and <b>tokens per minute (TPM)</b> for each model. Look yours up at <a href="https://platform.openai.com/settings/organization/limits" target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">platform.openai.com → Settings → Limits</a> and enter the values for the model you selected. The app paces requests so the total stays under both limits, counting each request's prompt, PDF and maximum output tokens, and corrects its estimate using the token counts OpenAI reports back. Each model has its own limit, so several selected models run side by side.</p>
+            <ul className="list-disc list-inside ml-4 text-sm text-muted-foreground space-y-1 mb-2">
+              <li>Lower values are always safe, just slower. If you share the API key with other running jobs or people, enter less than your full limit.</li>
+              <li>A full-text PDF is often 10,000–40,000 tokens. With a TPM limit below about 50,000, use 1–2 parallel requests; a single PDF larger than your TPM limit cannot be sent and that paper is reported as failed.</li>
+              <li>Parallel requests (1–16) only controls how many requests are in flight at once; the RPM/TPM pacing applies on top of it. 4 is a good default.</li>
+            </ul>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-2">What happens when something goes wrong</h3>
+            <ul className="list-disc list-inside ml-4 text-sm text-muted-foreground space-y-1 mb-2">
+              <li><b>Rate limit reached (429):</b> all requests for that model pause for the time OpenAI asks for (or a growing back-off), then continue. The paper is retried, not marked as failed.</li>
+              <li><b>Server errors, timeouts, network drops:</b> the request is retried a few times with increasing waits.</li>
+              <li><b>Out of credit or invalid API key:</b> the job stops with a message in Job Management. Fix the cause, then click <b>Resume</b>.</li>
+              <li><b>A single paper fails</b> (e.g. PDF over 50 MB, request too large): it is counted as failed and the job continues. When the job finishes, click <b>Retry failed</b> to run only those papers again.</li>
+              <li><b>Tab closed or reloaded:</b> the job shows as Interrupted. Open Job Management and click <b>Resume</b>; finished papers are kept and only the remaining ones are sent.</li>
+            </ul>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-2">Stopping, resuming and deleting</h3>
+            <p className="text-sm text-muted-foreground mb-2"><b>Stop</b> finishes the requests already in flight and then pauses the job; <b>Resume</b> continues where it left off. Deleting a job stops it and removes its stored results and PDFs from the browser.</p>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-2">Privacy and storage</h3>
+            <p className="text-sm text-muted-foreground mb-2">In synchronous full-text mode the matched PDF files are sent to OpenAI as part of each request. They are also stored in your browser (IndexedDB) so the job can be resumed, until you delete the job. Nothing is stored on any other server.</p>
+          </div>
         </CardContent>
       </Card>
 

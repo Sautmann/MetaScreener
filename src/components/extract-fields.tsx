@@ -16,6 +16,8 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { useCustomFields } from "@/hooks/use-custom-fields";
 import { processBatch } from "@/lib/batch-processor";
+import { DEFAULT_SYNC_CONCURRENCY, syncProcessor } from "@/lib/sync-processor";
+import { DEFAULT_RATE_LIMITS } from "@/lib/rate-limiter";
 import { addFile } from "@/lib/files-manager";
 import { createJob, updateJob } from "@/lib/job-manager";
 import { estimateTokens, extractPdfDataBatch, matchPdfsToPapersAsync, PDFMatch, stripReferences } from "@/lib/pdf-utils";
@@ -46,7 +48,8 @@ export default function ExtractFields() {
   const [file, setFile] = useState<File | null>(null);
   const [fileErrors, setFileErrors] = useState<string[]>([]);
   const currentCsvFile = file;
-  const [pdfFolder, setPdfFolder] = useState<FileList | null>(null);
+  // Only the .pdf files from the chosen folder; indices line up with pdfData
+  const [pdfFolder, setPdfFolder] = useState<File[] | null>(null);
   const [pdfData, setPdfData] = useState<Array<PDFData>>([]);
   const [extractDesign, setExtractDesign] = useState(true);
   const [extractMethod, setExtractMethod] = useState(true);
@@ -59,6 +62,12 @@ export default function ExtractFields() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadJsonl, setDownloadJsonl] = useState(false);
   const [removeReferences, setRemoveReferences] = useState(true);
+  const [processing, setProcessing] = useState<"batch" | "sync">("batch");
+  const [concurrency, setConcurrency] = useState(String(DEFAULT_SYNC_CONCURRENCY));
+  const [rpmLimit, setRpmLimit] = useState(String(DEFAULT_RATE_LIMITS.rpm));
+  const [tpmLimit, setTpmLimit] = useState(String(DEFAULT_RATE_LIMITS.tpm));
+  // Synchronous full-text jobs send the PDF files themselves instead of extracted text
+  const sendsPdfs = processing === "sync" && mode === "fulltext";
   const [temperature, setTemperature] = useState(String(DEFAULT_TEMPERATURE));
   const [maxCompletionTokens, setMaxCompletionTokens] = useState(String(DEFAULT_MAX_COMPLETION_TOKENS));
   const [systemPromptOverride, setSystemPromptOverride] = useState<string | undefined>(undefined);
@@ -192,7 +201,12 @@ export default function ExtractFields() {
 
   const handlePdfFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const pdfFiles = Array.from(e.target.files);
+      // A folder picker returns every file in the folder (spreadsheets, .DS_Store, ...)
+      const pdfFiles = Array.from(e.target.files).filter((f) => /\.pdf$/i.test(f.name));
+      if (pdfFiles.length === 0) {
+        toast.error("The selected folder contains no PDF files.");
+        return;
+      }
 
       setProcessingPdfs(true);
       setProcessingProgress({ current: 0, total: pdfFiles.length });
@@ -214,8 +228,8 @@ export default function ExtractFields() {
 
         console.timeEnd("Extracting PDF data");
         setPdfData(pdfDataResults);
-        setPdfFolder(e.target.files);
-        toast.success(`Successfully processed ${e.target.files.length} PDF files`);
+        setPdfFolder(pdfFiles);
+        toast.success(`Successfully processed ${pdfFiles.length} PDF files`);
 
         // If we have a CSV file selected, try to match the PDFs
         if (file) {
@@ -359,6 +373,20 @@ export default function ExtractFields() {
       return;
     }
 
+    const parsedConcurrency = Number(concurrency);
+    const parsedRpm = Number(rpmLimit);
+    const parsedTpm = Number(tpmLimit);
+    if (processing === "sync") {
+      if (!Number.isInteger(parsedConcurrency) || parsedConcurrency < 1 || parsedConcurrency > 16) {
+        toast.error("Parallel requests must be a whole number between 1 and 16.");
+        return;
+      }
+      if (!Number.isInteger(parsedRpm) || parsedRpm < 1 || !Number.isInteger(parsedTpm) || parsedTpm < 1000) {
+        toast.error("Enter your OpenAI rate limits: requests per minute (≥ 1) and tokens per minute (≥ 1,000).");
+        return;
+      }
+    }
+
     setIsSubmitting(true);
     try {
       // Prepare custom fields, including justification if enabled
@@ -469,6 +497,8 @@ export default function ExtractFields() {
           max_completion_tokens: parsedMaxTokens,
           systemPromptOverride,
           paperIdScheme: "row_index",
+          processing,
+          ...(processing === "sync" ? { concurrency: parsedConcurrency, rpmLimit: parsedRpm, tpmLimit: parsedTpm } : {}),
         }
       });
 
@@ -480,9 +510,17 @@ export default function ExtractFields() {
             : Array.from(pdfData),
           matches: pdfMatches,
         } : undefined;
-        await processBatch.start(job.id, papers, pdfParams);
-
-        toast.success("Job started successfully!");
+        if (processing === "sync") {
+          await syncProcessor.start(
+            job.id,
+            papers,
+            pdfParams && pdfFolder ? { ...pdfParams, files: pdfFolder } : undefined
+          );
+          toast.success("Job started. Keep this browser tab open until it finishes.");
+        } else {
+          await processBatch.start(job.id, papers, pdfParams);
+          toast.success("Job started successfully!");
+        }
         navigate('/job-management');
       } catch (error) {
         // update job status to failed
@@ -523,15 +561,24 @@ export default function ExtractFields() {
       .map((match) => pdfData[match.pdfIndex])
       .filter((pdf) => pdf && !pdf.fulltext?.trim());
     const tokensPerModel = pdfMatches.reduce((sum, match) => {
-      const text = pdfData[match.pdfIndex]?.fulltext || "";
+      const pdf = pdfData[match.pdfIndex];
+      const text = pdf?.fulltext || "";
+      if (sendsPdfs) {
+        // OpenAI sends the PDF's text plus an image of every page (~1k tokens each)
+        return sum + estimateTokens(text) + (pdf?.pages ?? 10) * 1000;
+      }
       return sum + estimateTokens(removeReferences ? stripReferences(text) : text);
     }, 0);
+    const totalTokens = tokensPerModel * Math.max(selectedModels.length, 1);
+    const tpm = Number(tpmLimit) || DEFAULT_RATE_LIMITS.tpm;
     return {
       matchedWithoutText,
       tokensPerModel,
-      totalTokens: tokensPerModel * Math.max(selectedModels.length, 1),
+      totalTokens,
+      // Each model has its own rate limit, so models run side by side
+      syncMinutes: Math.ceil(tokensPerModel / tpm),
     };
-  }, [pdfMatches, pdfData, removeReferences, selectedModels.length]);
+  }, [pdfMatches, pdfData, removeReferences, selectedModels.length, sendsPdfs, tpmLimit]);
 
   const downloadUnmatchedPdfs = () => {
     if (!pdfData || pdfData.length === 0) {
@@ -566,6 +613,7 @@ export default function ExtractFields() {
           <li>Upload your CSV file with papers (must include Title, Abstract, and DOI columns)</li>
           <li>Select screening mode: Abstract Only (faster) or Full Text (requires PDF upload)</li>
           <li>Choose one or more LLM models to run screening</li>
+          <li>Choose processing: Batch (cheaper, results within 24h) or Synchronous (results in minutes, sends the PDF files; keep this tab open)</li>
           <li>Configure fields to screen (default fields or add custom fields)</li>
           <li>Click "Start Screening" to create a batch job</li>
           <li>Monitor progress in <a href="/#/job-management" onClick={(e) => { e.preventDefault(); navigate('/job-management'); }} className="text-blue-600 hover:underline cursor-pointer">Job Management</a></li>
@@ -735,17 +783,95 @@ export default function ExtractFields() {
               <p className="text-xs text-muted-foreground">default {DEFAULT_MAX_COMPLETION_TOKENS} · not applied to GPT-5</p>
             </div>
           </div>
-          <div className="flex flex-col gap-2 mt-2">
-            <div className="flex items-center gap-2 cursor-pointer">
-              <Checkbox
-                id="downloadJsonl"
-                checked={downloadJsonl}
-                onCheckedChange={(checked) => setDownloadJsonl(checked === true)}
-              />
-              <Label htmlFor="downloadJsonl" className="text-sm">Download JSONL files for inspection</Label>
+          {processing === "batch" && (
+            <div className="flex flex-col gap-2 mt-2">
+              <div className="flex items-center gap-2 cursor-pointer">
+                <Checkbox
+                  id="downloadJsonl"
+                  checked={downloadJsonl}
+                  onCheckedChange={(checked) => setDownloadJsonl(checked === true)}
+                />
+                <Label htmlFor="downloadJsonl" className="text-sm">Download JSONL files for inspection</Label>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <Separator />
+
+      <div className="space-y-4">
+        <div>
+          <h3 className="text-lg font-medium">Processing</h3>
+          <p className="text-sm text-muted-foreground">How requests are sent to OpenAI</p>
+          <HelpText
+            text="Batch is cheaper and runs on OpenAI's side. Synchronous gives results within minutes and, in full-text mode, sends the PDF files themselves."
+            linkTo="/#/manual#processing-modes"
+            linkText="Learn more about processing modes"
+            className="mt-1"
+          />
+        </div>
+        <RadioGroup value={processing} onValueChange={(value) => setProcessing(value as "batch" | "sync")}>
+          <div className="flex items-start space-x-2">
+            <RadioGroupItem value="batch" id="processing-batch" className="mt-1" />
+            <Label htmlFor="processing-batch" className="font-normal leading-snug">
+              <span className="font-medium">Batch</span> (recommended for large jobs)
+              <span className="block text-xs text-muted-foreground">
+                About half the price. Results arrive within 24 hours; you can close the browser meanwhile.
+                Full text is sent as text extracted from the PDFs.
+              </span>
+            </Label>
+          </div>
+          <div className="flex items-start space-x-2">
+            <RadioGroupItem value="sync" id="processing-sync" className="mt-1" />
+            <Label htmlFor="processing-sync" className="font-normal leading-snug">
+              <span className="font-medium">Synchronous</span>
+              <span className="block text-xs text-muted-foreground">
+                Standard price. Results arrive as each paper finishes, but this browser tab must stay open.
+                In full-text mode the <b>PDF files themselves</b> are sent, so the model sees each page as an image as well as its text
+                (tables, symbols, layout and scanned pages are read correctly), at roughly 2–4× the input tokens.
+              </span>
+            </Label>
+          </div>
+        </RadioGroup>
+
+        {processing === "sync" && (
+          <div className="border rounded-lg p-4 space-y-3">
+            <div className="flex flex-wrap gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="concurrency" className="text-xs">Parallel requests</Label>
+                <Input id="concurrency" type="number" min={1} max={16} step={1} value={concurrency}
+                  onChange={(e) => setConcurrency(e.target.value)} className="w-28" />
+                <p className="text-xs text-muted-foreground">1–16 · default {DEFAULT_SYNC_CONCURRENCY}</p>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="rpm-limit" className="text-xs">Requests per minute</Label>
+                <Input id="rpm-limit" type="number" min={1} step={1} value={rpmLimit}
+                  onChange={(e) => setRpmLimit(e.target.value)} className="w-32" />
+                <p className="text-xs text-muted-foreground">your RPM limit</p>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="tpm-limit" className="text-xs">Tokens per minute</Label>
+                <Input id="tpm-limit" type="number" min={1000} step={1000} value={tpmLimit}
+                  onChange={(e) => setTpmLimit(e.target.value)} className="w-36" />
+                <p className="text-xs text-muted-foreground">your TPM limit</p>
+              </div>
+            </div>
+            <div className="text-xs text-muted-foreground space-y-1">
+              <p>
+                <b>Set these to your organisation&apos;s limits for the selected model</b>, listed on{" "}
+                <a href="https://platform.openai.com/settings/organization/limits" target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
+                  platform.openai.com → Settings → Limits
+                </a>. The app paces requests to stay under them; if OpenAI still answers &quot;rate limit reached&quot;, all requests pause and retry automatically, and nothing is lost.
+                Lower values are always safe, just slower. Limits apply per model, so several selected models run side by side.
+              </p>
+              <p>
+                Full-text PDFs are large (often 10,000–40,000 tokens each). If your tokens-per-minute limit is below about 50,000, use 1–2 parallel requests.
+                If you run out of credit or the API key is rejected, the job stops and can be resumed from Job Management.
+              </p>
             </div>
           </div>
-        </div>
+        )}
       </div>
 
       <Separator />
@@ -808,14 +934,19 @@ export default function ExtractFields() {
                 {pdfFolder.length} PDF files selected and processed
               </p>
             )}
-            <div className="flex items-center gap-2">
+            {!sendsPdfs && <div className="flex items-center gap-2">
               <Checkbox
                 id="removeReferences"
                 checked={removeReferences}
                 onCheckedChange={(checked) => setRemoveReferences(checked === true)}
               />
               <Label htmlFor="removeReferences" className="text-sm">Remove reference lists from full text (saves tokens, keeps appendices)</Label>
-            </div>
+            </div>}
+            {sendsPdfs && (
+              <p className="text-xs text-muted-foreground">
+                Synchronous mode sends each matched PDF file as is. Text is still extracted locally, but only to match PDFs to CSV rows.
+              </p>
+            )}
             <HelpText 
               text="Select a folder containing PDF files. Files are matched to CSV rows by DOI (PDF metadata, first page, or a DOI filename such as 10_1016_j_xyz_2020_1.pdf), then by title or filename."
               linkTo="/#/manual#extract-fields"
@@ -868,10 +999,16 @@ export default function ExtractFields() {
               )}
               {fulltextStats.matchedWithoutText.length > 0 && (
                 <div className="text-xs text-amber-600">
-                  {fulltextStats.matchedWithoutText.length} matched PDFs have no extractable text (scanned or protected?) and will be skipped.
+                  {fulltextStats.matchedWithoutText.length} matched PDFs have no extractable text (scanned or protected?)
+                  {sendsPdfs ? " — they are still sent, and the model reads the page images." : " and will be skipped. Synchronous mode can screen them from the page images."}
                 </div>
               )}
-              {fulltextStats.totalTokens > 1_000_000 && (
+              {sendsPdfs && pdfMatches.length > 0 && (
+                <div className="text-xs text-muted-foreground">
+                  At your tokens-per-minute limit this takes roughly {fulltextStats.syncMinutes} min (models run in parallel).
+                </div>
+              )}
+              {!sendsPdfs && fulltextStats.totalTokens > 1_000_000 && (
                 <div className="text-xs text-amber-600">
                   Large job (≈{fulltextStats.totalTokens.toLocaleString()} tokens across all models). OpenAI limits how many batch tokens can be queued per model; if a batch fails right away, split the CSV into smaller jobs.
                 </div>

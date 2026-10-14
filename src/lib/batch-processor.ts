@@ -13,19 +13,7 @@ export const processBatch = {
     if (!job) {
       throw new Error("Job not found");
     }
-    let filteredPapers: PaperWithFields[] = papers;
-    if (pdfParams){
-      addFullTextToPapers(papers, pdfParams);
-      // if pdfParams is provided, use only papers with full text
-      const papersWithText = papers.filter(paper => paper.fulltext?.trim());
-      if (papersWithText.length === 0) {
-        throw new Error("No papers with full text found for batch processing.");
-      }
-      filteredPapers = papersWithText.filter(paper => isPaperIncluded(paper, job.fields.custom));
-      if (filteredPapers.length === 0) {
-        throw new Error(`All ${papersWithText.length} papers with full text were skipped by the recheck settings.`);
-      }
-    }
+    const filteredPapers = selectPapers(papers, job.fields.custom, pdfParams);
     // Determine models to use (multi-model support)
     const models: string[] = (job.options?.models && job.options.models.length > 0)
       ? job.options.models
@@ -102,6 +90,32 @@ export const processBatch = {
     }
   },
 };
+
+/**
+ * Papers to send for screening. In full-text mode only papers with a matched PDF are kept
+ * (with extracted text, unless the PDF itself is sent), then the recheck filter is applied.
+ */
+export function selectPapers<T extends PaperWithFields>(
+  papers: T[],
+  customFields: Array<CustomField>,
+  pdfParams?: { pdfData: Array<PDFData>; matches: Array<PDFMatch> },
+  options: { requireExtractedText?: boolean } = { requireExtractedText: true }
+): T[] {
+  if (!pdfParams) return papers;
+  addFullTextToPapers(papers, pdfParams);
+  const matchedPaperIndices = new Set(pdfParams.matches.map((m) => m.paperIndex));
+  const papersWithText = papers.filter((paper, index) =>
+    options.requireExtractedText ? !!paper.fulltext?.trim() : matchedPaperIndices.has(index)
+  );
+  if (papersWithText.length === 0) {
+    throw new Error("No papers with full text found for batch processing.");
+  }
+  const included = papersWithText.filter((paper) => isPaperIncluded(paper, customFields));
+  if (included.length === 0) {
+    throw new Error(`All ${papersWithText.length} papers with full text were skipped by the recheck settings.`);
+  }
+  return included;
+}
 
 function addFullTextToPapers(papers: Paper[], pdfParams: {
   pdfData: Array<PDFData>,

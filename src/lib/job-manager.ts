@@ -7,7 +7,11 @@ export async function createJob(jobData: Omit<Job, "id">): Promise<Job> {
 }
 
 export async function deleteJob(id: number): Promise<void> {
-  await db.jobs.delete(id);
+  await db.transaction("rw", db.jobs, db.files, db.syncTasks, async () => {
+    await db.jobs.delete(id);
+    await db.files.where("jobId").equals(id).delete();
+    await db.syncTasks.where("jobId").equals(id).delete();
+  });
 }
 
 export async function getJob(id: number): Promise<Job | undefined> {
